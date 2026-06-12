@@ -258,6 +258,14 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(VmAction::Snapshot(Arc::default()))),
     );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-layered"),
+        Box::new(VmActionHandler::new(VmAction::SnapshotLayered(Arc::default()))),
+    );
+    r.routes.insert(
+        endpoint!("/vm.restore-layered"),
+        Box::new(VmActionHandler::new(VmAction::RestoreLayered(Arc::default()))),
+    );
     #[cfg(feature = "guest_debug")]
     r.routes.insert(
         endpoint!("/vm.coredump"),

@@ -101,6 +101,12 @@ pub enum ApiError {
     /// The VM could not restored.
     VmRestore(VmError),
 
+    /// The VM could not be layered snapshotted.
+    VmSnapshotLayered(VmError),
+
+    /// The VM could not be restored from layered snapshot.
+    VmRestoreLayered(VmError),
+
     /// The VM could not be coredumped.
     VmCoredump(VmError),
 
@@ -180,6 +186,8 @@ impl Display for ApiError {
             VmReboot(vm_error) => write!(f, "{}", vm_error),
             VmSnapshot(vm_error) => write!(f, "{}", vm_error),
             VmRestore(vm_error) => write!(f, "{}", vm_error),
+            VmSnapshotLayered(vm_error) => write!(f, "{}", vm_error),
+            VmRestoreLayered(vm_error) => write!(f, "{}", vm_error),
             VmCoredump(vm_error) => write!(f, "{}", vm_error),
             VmmShutdown(vm_error) => write!(f, "{}", vm_error),
             VmResize(vm_error) => write!(f, "{}", vm_error),
@@ -259,6 +267,46 @@ pub struct VmSendMigrationData {
     /// Send memory across socket without copying
     #[serde(default)]
     pub local: bool,
+}
+
+/// Configuration for layered snapshot creation
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct LayeredSnapshotConfig {
+    /// The snapshot destination URL
+    pub destination_url: String,
+    /// Path to L0 memfile (optional)
+    pub l0_memfile_path: Option<String>,
+    /// Path to L1 memfile (optional)
+    pub l1_memfile_path: Option<String>,
+    /// Build ID for L0 layer
+    pub l0_build_id: Option<String>,
+    /// Build ID for L1 layer
+    pub l1_build_id: Option<String>,
+}
+
+/// Configuration for layered snapshot restore
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct LayeredRestoreConfig {
+    /// The snapshot source URL
+    pub source_url: String,
+    /// Path to store the L2 overlay
+    pub overlay_dir: String,
+    /// Path to L0 memfile (optional, will use metadata if not provided)
+    pub l0_memfile_path: Option<String>,
+    /// Path to L1 memfile (optional, will use metadata if not provided)
+    pub l1_memfile_path: Option<String>,
+    /// Memory volume URL (for cubecow-backed memory)
+    pub memory_vol_url: Option<String>,
+    /// Disk configurations (optional, will update snapshot config)
+    pub disks: Option<Vec<DiskConfig>>,
+    /// Network configurations (optional, will update snapshot config)
+    pub net: Option<Vec<NetConfig>>,
+    /// Vsock configuration (optional, will update snapshot config)
+    pub vsock: Option<VsockConfig>,
+    /// Filesystem configurations (optional, will update snapshot config)
+    pub fs: Option<Vec<FsConfig>>,
+    /// PMEM configurations (optional, will update snapshot config)
+    pub pmem: Option<Vec<PmemConfig>>,
 }
 
 pub enum ApiResponsePayload {
@@ -382,6 +430,12 @@ pub enum ApiRequest {
     /// Restore from a VM snapshot
     VmRestore(Arc<RestoreConfig>),
 
+    /// Take a layered VM snapshot (L0/L1/L2)
+    VmSnapshotLayered(Arc<LayeredSnapshotConfig>),
+
+    /// Restore from a layered VM snapshot (L0/L1/L2)
+    VmRestoreLayered(Arc<LayeredRestoreConfig>),
+
     /// Take a VM coredump
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     VmCoredump(Arc<VmCoredumpData>),
@@ -480,6 +534,12 @@ pub enum VmAction {
     /// Snapshot VM
     Snapshot(Arc<SnapshotConfig>),
 
+    /// Layered Snapshot VM (L0/L1/L2)
+    SnapshotLayered(Arc<LayeredSnapshotConfig>),
+
+    /// Restore VM from layered snapshot (L0/L1/L2)
+    RestoreLayered(Arc<LayeredRestoreConfig>),
+
     /// Coredump VM
     #[cfg(feature = "guest_debug")]
     Coredump(Arc<VmCoredumpData>),
@@ -520,6 +580,8 @@ fn vm_action(action: VmAction) -> ApiResult<Option<Body>> {
         ResizeZone(v) => ApiRequest::VmResizeZone(v),
         Restore(v) => ApiRequest::VmRestore(v),
         Snapshot(v) => ApiRequest::VmSnapshot(v),
+        SnapshotLayered(v) => ApiRequest::VmSnapshotLayered(v),
+        RestoreLayered(v) => ApiRequest::VmRestoreLayered(v),
         #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
         Coredump(v) => ApiRequest::VmCoredump(v),
         ReceiveMigration(v) => ApiRequest::VmReceiveMigration(v),
@@ -595,6 +657,14 @@ pub fn vm_snapshot(data: Arc<SnapshotConfig>) -> ApiResult<Option<Body>> {
 
 pub fn vm_restore(data: Arc<RestoreConfig>) -> ApiResult<Option<Body>> {
     vm_action(VmAction::Restore(data))
+}
+
+pub fn vm_snapshot_layered(data: Arc<LayeredSnapshotConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::SnapshotLayered(data))
+}
+
+pub fn vm_restore_layered(data: Arc<LayeredRestoreConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::RestoreLayered(data))
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]

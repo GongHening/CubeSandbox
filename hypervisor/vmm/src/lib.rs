@@ -77,14 +77,19 @@ pub mod device_tree;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 pub mod interrupt;
+pub mod cow_overlay;
 pub mod memory_manager;
+pub mod memory_reclaim;
 pub mod migration;
 pub mod pagemap_anon;
 mod pci_segment;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
+pub mod shared_memfile;
+pub mod snapshot_layers;
 pub mod soft_dirty;
+pub mod uffd;
 pub mod vm;
 pub mod vm_config;
 
@@ -728,6 +733,142 @@ impl Vmm {
 
         self.vm_config = Some(vm_config.clone());
         self.vm = Some(vm);
+
+        Ok(())
+    }
+
+    fn vm_snapshot_layered(
+        &mut self,
+        snapshot_config: &api::LayeredSnapshotConfig,
+    ) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            let l0_path = snapshot_config.l0_memfile_path.as_deref().map(std::path::Path::new);
+            let l1_path = snapshot_config.l1_memfile_path.as_deref().map(std::path::Path::new);
+
+            let config = SnapshotConfig {
+                destination_url: snapshot_config.destination_url.clone(),
+                ..Default::default()
+            };
+
+            let metadata = vm
+                .snapshot_layered(&config, l0_path, l1_path)
+                .map_err(VmError::Snapshot)?;
+
+            info!(
+                "Layered snapshot created: L0={}, L1={}, L2_size={}",
+                metadata.l0.is_some(),
+                metadata.l1.is_some(),
+                metadata.l2_memfile_size
+            );
+
+            Ok(())
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_restore_layered(
+        &mut self,
+        restore_config: &api::LayeredRestoreConfig,
+    ) -> result::Result<(), VmError> {
+        if self.vm.is_some() || self.vm_config.is_some() {
+            return Err(VmError::VmAlreadyCreated);
+        }
+
+        let source_url = &restore_config.source_url;
+        let overlay_dir = std::path::Path::new(&restore_config.overlay_dir);
+
+        // Strip file:// prefix if present to get the actual filesystem path
+        let source_path = if source_url.starts_with("file://") {
+            source_url.strip_prefix("file://").unwrap_or(source_url)
+        } else {
+            source_url
+        };
+
+        // Read layered metadata
+        let metadata_path = std::path::Path::new(source_path).join("layered_metadata.json");
+        let metadata_json = std::fs::read_to_string(&metadata_path)
+            .map_err(|e| VmError::Restore(MigratableError::Restore(anyhow::anyhow!("Failed to read layered metadata from {:?}: {}", metadata_path, e))))?;
+        let metadata: crate::snapshot_layers::LayeredSnapshotMetadata =
+            serde_json::from_str(&metadata_json)
+                .map_err(|e| VmError::Restore(MigratableError::Restore(anyhow::anyhow!("Failed to parse layered metadata: {}", e))))?;
+
+        // Read VM config and update with restore config
+        let config_path = std::path::Path::new(source_path).join("config.json");
+        let config_json = std::fs::read_to_string(&config_path)
+            .map_err(|e| VmError::Restore(MigratableError::Restore(anyhow::anyhow!("Failed to read VM config: {}", e))))?;
+        let mut vm_config: VmConfig = serde_json::from_str(&config_json)
+            .map_err(|e| VmError::Restore(MigratableError::Restore(anyhow::anyhow!("Failed to parse VM config: {}", e))))?;
+
+        // Update VM config with restore config (disk, net, vsock, fs, pmem)
+        if let Some(disks) = &restore_config.disks {
+            vm_config.update_disks(disks);
+        }
+        if let Some(nets) = &restore_config.net {
+            vm_config.update_nets(nets);
+        }
+        if let Some(vsock) = &restore_config.vsock {
+            vm_config.update_vsock(vsock);
+        }
+        if let Some(fses) = &restore_config.fs {
+            vm_config.update_fses(fses);
+        }
+        if let Some(pmems) = &restore_config.pmem {
+            vm_config.update_pmem(pmems);
+        }
+
+        let vm_config = Arc::new(Mutex::new(vm_config));
+
+        // Create snapshot layer manager
+        let mut layer_manager = crate::snapshot_layers::SnapshotLayerManager::new();
+        layer_manager.initialize(metadata)
+            .map_err(|e| VmError::Restore(MigratableError::Restore(anyhow::anyhow!("Failed to initialize layer manager: {}", e))))?;
+
+        info!("Restoring from layered snapshot with shared memory");
+
+        // For now, fall back to standard restore path
+        // The layered optimization is used for cross-VM sharing at the page cache level
+        let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
+        #[cfg(feature = "guest_debug")]
+        let debug_evt = self
+            .vm_debug_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+        let activate_evt = self
+            .activate_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+
+        // Use source_url (with file:// prefix) for recv_vm_state
+        let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+
+        let memory_vol_url_ref = restore_config.memory_vol_url.as_deref();
+        let mut vm = Vm::new_from_snapshot(
+            &snapshot,
+            vm_config.clone(),
+            exit_evt,
+            reset_evt,
+            #[cfg(feature = "guest_debug")]
+            debug_evt,
+            Some(source_url),
+            false, // prefault
+            &self.seccomp_action,
+            self.hypervisor.clone(),
+            activate_evt,
+            self.sandbox_id.clone(),
+            self.vcpu_started.clone(),
+            memory_vol_url_ref,
+        )?;
+
+        // Restore the VM
+        vm.restore(snapshot).map_err(VmError::Restore)?;
+        vm.resume().map_err(VmError::Resume)?;
+
+        self.vm_config = Some(vm_config.clone());
+        self.vm = Some(vm);
+
+        info!("Successfully restored from layered snapshot");
 
         Ok(())
     }
@@ -1997,6 +2138,22 @@ impl Vmm {
                                     let response = self
                                         .vm_restore(restore_data.as_ref().clone())
                                         .map_err(ApiError::VmRestore)
+                                        .map(|_| ApiResponsePayload::Empty);
+
+                                    res_sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmSnapshotLayered(snapshot_config) => {
+                                    let response = self
+                                        .vm_snapshot_layered(&snapshot_config)
+                                        .map_err(ApiError::VmSnapshotLayered)
+                                        .map(|_| ApiResponsePayload::Empty);
+
+                                    res_sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmRestoreLayered(restore_config) => {
+                                    let response = self
+                                        .vm_restore_layered(&restore_config)
+                                        .map_err(ApiError::VmRestoreLayered)
                                         .map(|_| ApiResponsePayload::Empty);
 
                                     res_sender.send(response).map_err(Error::ApiResponseSend)?;

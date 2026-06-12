@@ -1,6 +1,8 @@
 module github.com/tencentcloud/CubeSandbox/Cubelet
 
-go 1.24.8
+go 1.24.3
+
+toolchain go1.24.8
 
 require (
 	github.com/cilium/ebpf v0.17.3 // indirect

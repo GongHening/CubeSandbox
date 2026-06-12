@@ -24,7 +24,7 @@ use containerd_shim::protos::protobuf::MessageDyn;
 use containerd_shim::{Error, Result};
 use cube_hypervisor::config::RestoreConfig;
 use cube_hypervisor::vm_config::{DeviceConfig, FsConfig};
-use cube_hypervisor::{SnapshotType, VmRemoveDeviceData};
+use cube_hypervisor::{SnapshotType, VmRemoveDeviceData, LayeredRestoreConfig};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use protoc::{agent, agent_ttrpc, health, health_ttrpc};
 use std::collections::{HashMap, HashSet};
@@ -873,19 +873,65 @@ impl SandBox {
         let pmems = Utils::restore_pmems_config(&self.conf.pmem);
         let vsock = Utils::gen_vsock_config(&self.id);
 
-        let ch = self.ch.as_mut().unwrap().lock().await;
-        let config = RestoreConfig {
-            source_url: PathBuf::from(snapshot),
-            fs: Some(fss),
-            net: Some(nets),
-            disks: Some(disks),
-            pmem: Some(pmems),
-            vsock: Some(vsock),
-            memory_vol_url: restore_memory_vol_url,
-            ..Default::default()
+        // Check if layered snapshot metadata exists
+        // Strip file:// prefix if present to get the actual filesystem path
+        let snapshot_path = if snapshot.starts_with("file://") {
+            snapshot.strip_prefix("file://").unwrap_or(&snapshot)
+        } else {
+            &snapshot
         };
+        let layered_metadata_path = std::path::Path::new(snapshot_path).join("layered_metadata.json");
+        let use_layered_restore = layered_metadata_path.exists();
 
-        ch.restore_vm(config).await?;
+        if use_layered_restore {
+            infof!(self.log, "Detected layered snapshot metadata at {:?}, using layered restore", layered_metadata_path);
+        }
+
+        let ch = self.ch.as_mut().unwrap().lock().await;
+
+        if use_layered_restore {
+            // Use layered restore
+            // The hypervisor expects file:// URLs for source_url
+            let source_url = if snapshot.starts_with("file://") {
+                snapshot.clone()
+            } else {
+                format!("file://{}", snapshot)
+            };
+            // Strip file:// prefix for overlay_dir (filesystem path)
+            let source_path = if source_url.starts_with("file://") {
+                source_url.strip_prefix("file://").unwrap_or(&source_url)
+            } else {
+                &source_url
+            };
+            let overlay_dir = std::path::Path::new(source_path).join("l2_overlay");
+            let layered_config = LayeredRestoreConfig {
+                source_url: source_url,
+                overlay_dir: overlay_dir.to_string_lossy().to_string(),
+                l0_memfile_path: None,
+                l1_memfile_path: None,
+                memory_vol_url: restore_memory_vol_url.clone(),
+                disks: Some(disks),
+                net: Some(nets),
+                vsock: Some(vsock),
+                fs: Some(fss),
+                pmem: Some(pmems),
+            };
+            ch.restore_vm_layered(layered_config).await?;
+        } else {
+            // Use standard restore
+            let config = RestoreConfig {
+                source_url: PathBuf::from(snapshot),
+                fs: Some(fss),
+                net: Some(nets),
+                disks: Some(disks),
+                pmem: Some(pmems),
+                vsock: Some(vsock),
+                memory_vol_url: restore_memory_vol_url,
+                ..Default::default()
+            };
+            ch.restore_vm(config).await?;
+        }
+
         /*
         let ev = ch
             .wait_notify(Duration::from_nanos(self.ctx.timeout_nano as u64))

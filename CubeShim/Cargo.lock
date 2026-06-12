@@ -3224,6 +3224,7 @@ dependencies = [
  "log",
  "micro_http",
  "net_util",
+ "nix 0.29.0",
  "once_cell",
  "option_parser",
  "pci",

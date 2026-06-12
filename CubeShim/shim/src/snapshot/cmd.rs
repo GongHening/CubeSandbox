@@ -3,7 +3,7 @@
 //
 
 use anyhow::{anyhow, Result};
-use clap::{ArgAction, Args};
+use clap::{ArgAction, Args, Subcommand};
 use cube_hypervisor::SnapshotType;
 use uuid::Uuid;
 
@@ -13,6 +13,102 @@ use crate::{
 };
 
 use super::Snapshot;
+use super::layered::{LayeredSnapshotOrchestrator, Layer};
+
+#[derive(Args, Debug)]
+pub struct LayeredSnapshotArgs {
+    /// Target path for storing the layered snapshot
+    #[arg(
+        long = "path",
+        value_name = "target path",
+        help = "target path for layered snapshot",
+        required = true
+    )]
+    pub path: String,
+
+    /// Kernel path
+    #[arg(
+        long = "kernel",
+        value_name = "kernel path",
+        help = "kernel path",
+        required = true
+    )]
+    pub kernel: String,
+
+    /// L0 rootfs path
+    #[arg(
+        long = "l0-rootfs",
+        value_name = "L0 rootfs path",
+        help = "L0 (infrastructure) rootfs path",
+        required = true
+    )]
+    pub l0_rootfs: String,
+
+    /// L1 rootfs path
+    #[arg(
+        long = "l1-rootfs",
+        value_name = "L1 rootfs path",
+        help = "L1 (runtime) rootfs path",
+        required = true
+    )]
+    pub l1_rootfs: String,
+
+    /// Number of vCPUs
+    #[arg(
+        long = "vcpus",
+        value_name = "vcpus",
+        help = "number of vCPUs",
+        default_value = "1"
+    )]
+    pub vcpus: u32,
+
+    /// Memory size in MB
+    #[arg(
+        long = "memory-mb",
+        value_name = "memory MB",
+        help = "memory size in MB",
+        default_value = "256"
+    )]
+    pub memory_mb: u32,
+
+    /// Snapshot type
+    #[arg(
+        long = "snapshot-type",
+        value_name = "snapshot type",
+        help = "snapshot type: 'full', 'incremental' or 'soft-dirty'",
+        default_value = "full"
+    )]
+    pub snapshot_type: String,
+}
+
+pub async fn execute_layered(args: LayeredSnapshotArgs) -> Result<()> {
+    let snapshot_type = args
+        .snapshot_type
+        .parse::<SnapshotType>()
+        .map_err(|e| anyhow!("invalid snapshot type: {}", e))?;
+
+    let orchestrator = LayeredSnapshotOrchestrator::new(
+        std::path::Path::new(&args.path),
+        &args.kernel,
+        std::path::Path::new(&args.l0_rootfs),
+        std::path::Path::new(&args.l1_rootfs),
+        args.vcpus,
+        args.memory_mb,
+        snapshot_type,
+    );
+
+    let metadata = orchestrator
+        .create_layered_snapshots()
+        .map_err(|e| anyhow!("failed to create layered snapshot: {}", e))?;
+
+    println!("Layered snapshot created successfully:");
+    println!("  L0: {:?}", metadata.l0.map(|l| l.memfile_path));
+    println!("  L1: {:?}", metadata.l1.map(|l| l.memfile_path));
+    println!("  L2 size: {} bytes", metadata.l2_memfile_size);
+    println!("  Guest memory: {} bytes", metadata.guest_memory_size);
+
+    Ok(())
+}
 
 #[derive(Args, Debug)]
 pub struct SnapshotArgs {

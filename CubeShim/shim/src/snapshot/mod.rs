@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 pub mod cmd;
+pub mod layered;
 
 pub const SUB_CMD: &str = "snapshot";
 pub const P_PATH: &str = "path";

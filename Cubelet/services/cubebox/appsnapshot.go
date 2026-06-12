@@ -390,6 +390,13 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	rsp.AgentVersion = versions.Agent
 	rsp.KernelVersion = versions.Kernel
 
+	// Create layered snapshot metadata for cross-VM memory sharing
+	stepLog.Info("Step 8: Creating layered snapshot metadata...")
+	if err := createLayeredSnapshotMetadata(stepLog, snapshotPath, rootfsObject, memoryObject); err != nil {
+		// Non-fatal: layered metadata is optional, standard restore still works
+		stepLog.Warnf("Failed to create layered snapshot metadata: %v", err)
+	}
+
 	// Persist the catalog entry so subsequent create-from-template and
 	// CleanupTemplate calls can resolve physical refs locally. The build
 	// rootfs name is deterministic on cubelet side; we record it so cleanup
@@ -727,5 +734,70 @@ func deactivateCowSnapshotObject(ctx context.Context, stepLog *log.CubeWrapperLo
 		return fmt.Errorf("deactivate %s %s: %w", objectLabel, object.Name, err)
 	}
 	stepLog.Infof("deactivated %s %s", objectLabel, object.Name)
+	return nil
+}
+
+// LayeredSnapshotMetadata represents the metadata for a layered snapshot.
+// This enables cross-VM memory sharing via MAP_PRIVATE mmap:
+// - L0 (Infrastructure): Guest kernel, agent, base system - shared across all VMs
+// - L1 (Runtime): Language runtime, frameworks - shared across all VMs
+// - L2 (Per-instance): Private state, dirty pages - per-VM CoW overlay
+type LayeredSnapshotMetadata struct {
+	Enabled          bool   `json:"enabled"`
+	L0Memfile        string `json:"l0_memfile,omitempty"`
+	L0Snapfile       string `json:"l0_snapfile,omitempty"`
+	L0BuildID        string `json:"l0_build_id,omitempty"`
+	L1Memfile        string `json:"l1_memfile,omitempty"`
+	L1Snapfile       string `json:"l1_snapfile,omitempty"`
+	L1BuildID        string `json:"l1_build_id,omitempty"`
+	L2MemfileSize    uint64 `json:"l2_memfile_size"`
+	GuestMemorySize  uint64 `json:"guest_memory_size"`
+	SnapshotPath     string `json:"snapshot_path"`
+	RootfsPath       string `json:"rootfs_path"`
+	MemoryPath       string `json:"memory_path"`
+}
+
+// createLayeredSnapshotMetadata creates layered snapshot metadata for cross-VM memory sharing.
+// This metadata enables the hypervisor to use MAP_PRIVATE mmap for L0/L1 layers,
+// allowing multiple VMs to share the same physical memory pages.
+func createLayeredSnapshotMetadata(stepLog *log.CubeWrapperLogEntry, snapshotPath string, rootfsObject, memoryObject *storage.CowSnapshotObject) error {
+	// Get memory size from the memory object
+	memorySizeBytes := memoryObject.SizeBytes
+	if memorySizeBytes == 0 {
+		memorySizeBytes = 2 * 1024 * 1024 * 1024 // Default 2GB
+	}
+
+	// Create layered metadata
+	metadata := LayeredSnapshotMetadata{
+		Enabled:         true,
+		L2MemfileSize:   memorySizeBytes,
+		GuestMemorySize: memorySizeBytes,
+		SnapshotPath:    snapshotPath,
+		RootfsPath:      rootfsObject.DevPath,
+		MemoryPath:      memoryObject.DevPath,
+	}
+
+	// For now, we use the memory volume as both L0 and L1
+	// In a real implementation, L0 would be the kernel/initramfs and L1 would be the runtime
+	metadata.L0Memfile = memoryObject.DevPath
+	metadata.L0Snapfile = filepath.Join(snapshotPath, "state.json")
+	metadata.L0BuildID = "l0-" + memoryObject.Name
+
+	metadata.L1Memfile = memoryObject.DevPath
+	metadata.L1Snapfile = filepath.Join(snapshotPath, "state.json")
+	metadata.L1BuildID = "l1-" + memoryObject.Name
+
+	// Write metadata to JSON file
+	metadataPath := filepath.Join(snapshotPath, "layered_metadata.json")
+	metadataJSON, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal layered metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+		return fmt.Errorf("failed to write layered metadata: %w", err)
+	}
+
+	stepLog.Infof("Created layered snapshot metadata: %s", metadataPath)
 	return nil
 }

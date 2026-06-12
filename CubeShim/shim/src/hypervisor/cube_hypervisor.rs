@@ -11,7 +11,7 @@ use cube_hypervisor::config::RestoreConfig;
 use cube_hypervisor::vm_config::{DeviceConfig, FsConfig};
 use cube_hypervisor::{
     self, config, vmm_config, ApiRequest, ApiResponsePayload, SnapshotConfig, SnapshotType,
-    VmRemoveDeviceData,
+    VmRemoveDeviceData, LayeredRestoreConfig,
 };
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
@@ -175,6 +175,18 @@ impl CubeHypervisor {
             .send_request(ApiRequest::VmRestore(restore_config))
             .map_err(|e| self.status_err(format!("Restore vm failed:{}", e)))?
             .map_err(|e| self.status_err(format!("Restore vm failed:{}", e)))?;
+        stat.set_ok();
+        Ok(())
+    }
+
+    pub async fn restore_vm_layered(&self, config: LayeredRestoreConfig) -> CResult<()> {
+        let ch = self.ch.as_ref().unwrap().lock().await;
+        let mut stat = self.new_stat("RestoreVmLayered".to_string());
+        let restore_config = Arc::new(config);
+        let _ = ch
+            .send_request(ApiRequest::VmRestoreLayered(restore_config))
+            .map_err(|e| self.status_err(format!("Restore vm layered failed:{}", e)))?
+            .map_err(|e| self.status_err(format!("Restore vm layered failed:{}", e)))?;
         stat.set_ok();
         Ok(())
     }
